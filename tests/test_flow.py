@@ -28,6 +28,10 @@ class ProcurementFlowTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def bid(self, vendor, actor, number, price, quality):
+        qualification = self.service.qualification.submit_qualification(
+            actor, "vendor", self.tender["id"], vendor["id"], {"营业执照": "有效"}
+        )
+        self.service.qualification.review_qualification("proc1", "procurement", qualification["id"], "approved")
         return self.service.submit_bid(actor, "vendor", self.tender["id"], vendor["id"], {"报价": price, "质量": quality}, price)
 
     def test_complete_sealed_bid_open_evaluate_and_award_flow(self):

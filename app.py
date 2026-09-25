@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from qualification import QualificationError, QualificationService
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "public_procurement.db"
 
@@ -58,6 +60,7 @@ class ProcurementService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
         self._init_schema()
+        self.qualification = QualificationService(self.db_path)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -273,6 +276,13 @@ class ProcurementService:
             vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
             if not vendor:
                 raise DomainError("供应商不存在", 404)
+            qualification_status = self.qualification.status_of(conn, tender_id, vendor_id)
+            if qualification_status is None:
+                raise DomainError("供应商未提交资格预审材料，不能投标", 403)
+            if qualification_status == "pending":
+                raise DomainError("资格预审材料尚未审核，不能投标", 403)
+            if qualification_status != "approved":
+                raise DomainError("资格预审未通过，不能投标", 403)
             if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
                 pass
             existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
@@ -582,7 +592,10 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            qualifications = self.qualification.list_qualifications(
+                conn, tender_id, with_materials=role in {"procurement", "supervisor", "auditor"}
+            )
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "qualifications": qualifications}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -614,7 +627,11 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            qualifications = self.qualification.list_qualifications(
+                conn, with_materials=role in {"procurement", "supervisor", "auditor"}
+            )
+        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline,
+                "qualifications": qualifications, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -628,6 +645,10 @@ class ProcurementService:
              {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100}],
         )
         published = self.publish_tender("proc-demo", "procurement", tender["id"], tender["version"])
+        qualification = self.qualification.submit_qualification(
+            "vendor-demo", "vendor", tender["id"], vendor["id"], {"营业执照": "已年检", "资质证书": "ISO9001"}
+        )
+        self.qualification.review_qualification("proc-demo", "procurement", qualification["id"], "approved")
         self.submit_bid("vendor-demo", "vendor", tender["id"], vendor["id"], {"价格": 900000, "质量": 90}, 900000)
         return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"], "published_version": published["version"]}
 
@@ -680,7 +701,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(200, self.service.get_tender(actor, role, int(path.split("/")[3])))
             else:
                 self._send(404, {"error": "接口不存在"})
-        except DomainError as exc:
+        except (DomainError, QualificationError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (ValueError, IndexError) as exc:
             self._send(400, {"error": str(exc)})
@@ -694,6 +715,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.create_tender(actor, role, **data)
             elif path == "/api/tenders/publish":
                 result = self.service.publish_tender(actor, role, **data)
+            elif path == "/api/qualifications":
+                result = self.service.qualification.submit_qualification(actor, role, **data)
+            elif path == "/api/qualifications/review":
+                result = self.service.qualification.review_qualification(actor, role, **data)
             elif path == "/api/bids":
                 result = self.service.submit_bid(actor, role, **data)
             elif path == "/api/bids/withdraw":
@@ -719,7 +744,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
-        except DomainError as exc:
+        except (DomainError, QualificationError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
