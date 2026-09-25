@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from qualification import SCHEMA as QUALIFICATION_SCHEMA
+from qualification import QualificationError, QualificationService
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "public_procurement.db"
 
@@ -57,6 +60,7 @@ def canonical_hash(value: Any) -> str:
 class ProcurementService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
+        self.qualification = QualificationService()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -166,6 +170,7 @@ class ProcurementService:
                 CREATE INDEX IF NOT EXISTS idx_eval_bid_round ON evaluations(bid_id,evaluation_round);
                 """
             )
+            conn.executescript(QUALIFICATION_SCHEMA)
 
     def _audit(self, conn: sqlite3.Connection, tender_id: int | None, actor: str,
                action: str, details: dict[str, Any]) -> None:
@@ -251,6 +256,29 @@ class ProcurementService:
             self._audit(conn, tender_id, actor, "tender.published", {"deadline": tender["deadline"]})
             return dict(self._tender(conn, tender_id))
 
+    def submit_qualification(self, actor: str, role: str, tender_id: int, vendor_id: int,
+                             materials: list[dict[str, Any]]) -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"vendor"}, "提交资格材料")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = self.qualification.submit_materials(conn, tender_id, vendor_id, actor, materials)
+            self._audit(conn, tender_id, actor, "qualification.submitted",
+                        {"qualification_id": record["id"], "vendor_id": vendor_id,
+                         "materials": [m["name"] for m in record["materials"]]})
+            return record
+
+    def review_qualification(self, actor: str, role: str, qualification_id: int, decision: str,
+                             comment: str = "") -> dict[str, Any]:
+        actor = clean_actor(actor)
+        require_role(role, {"procurement", "supervisor"}, "审核资格材料")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            record = self.qualification.review(conn, qualification_id, actor, decision, comment)
+            self._audit(conn, record["tender_id"], actor, "qualification.reviewed",
+                        {"qualification_id": record["id"], "vendor_id": record["vendor_id"], "decision": record["status"]})
+            return record
+
     def submit_bid(self, actor: str, role: str, tender_id: int, vendor_id: int,
                    payload: dict[str, Any], price: float, expected_version: int | None = None) -> dict[str, Any]:
         actor = clean_actor(actor)
@@ -273,6 +301,7 @@ class ProcurementService:
             vendor = conn.execute("SELECT * FROM vendors WHERE id=?", (vendor_id,)).fetchone()
             if not vendor:
                 raise DomainError("供应商不存在", 404)
+            self.qualification.assert_can_bid(conn, tender_id, vendor_id)
             if not conn.execute("SELECT 1 FROM conflicts WHERE tender_id=? AND vendor_id=? AND evaluator=?", (tender_id, vendor_id, actor)).fetchone():
                 pass
             existing = conn.execute("SELECT * FROM bids WHERE tender_id=? AND vendor_id=?", (tender_id, vendor_id)).fetchone()
@@ -582,7 +611,8 @@ class ProcurementService:
                 "SELECT id,tender_id,vendor_id,question,answer,status,answered_at FROM clarifications WHERE tender_id=? AND status='published' ORDER BY id",
                 (tender_id,),
             ).fetchall()]
-            return {"tender": tender, "bids": bids, "clarifications": clarifications}
+            qualifications = self.qualification.list_for_tender(conn, tender_id)
+            return {"tender": tender, "bids": bids, "clarifications": clarifications, "qualifications": qualifications}
 
     def state(self, actor: str = "", role: str = "public") -> dict[str, Any]:
         with self.connect() as conn:
@@ -614,7 +644,8 @@ class ProcurementService:
                 ).fetchall()]
             else:
                 bids, complaints = [], []
-        return {"tenders": tenders, "bids": bids, "complaints": complaints, "timeline": timeline, "role": role}
+            qualifications = self.qualification.list_recent(conn)
+        return {"tenders": tenders, "bids": bids, "complaints": complaints, "qualifications": qualifications, "timeline": timeline, "role": role}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -628,6 +659,9 @@ class ProcurementService:
              {"name": "质量", "weight": 40, "kind": "direct", "max_value": 100}],
         )
         published = self.publish_tender("proc-demo", "procurement", tender["id"], tender["version"])
+        qualification = self.submit_qualification("vendor-demo", "vendor", tender["id"], vendor["id"],
+                                                  [{"name": "营业执照", "note": "有效期内"}, {"name": "纳税证明"}])
+        self.review_qualification("proc-demo", "procurement", qualification["id"], "approved", "材料齐全")
         self.submit_bid("vendor-demo", "vendor", tender["id"], vendor["id"], {"价格": 900000, "质量": 90}, 900000)
         return {"seeded": True, "tender_id": tender["id"], "vendor_id": vendor["id"], "published_version": published["version"]}
 
@@ -690,6 +724,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             path, data, (actor, role) = urlparse(self.path).path, self._json(), self._headers()
             if path == "/api/vendors":
                 result = self.service.create_vendor(actor, role, **data)
+            elif path == "/api/qualifications":
+                result = self.service.submit_qualification(actor, role, **data)
+            elif path == "/api/qualifications/review":
+                result = self.service.review_qualification(actor, role, **data)
             elif path == "/api/tenders":
                 result = self.service.create_tender(actor, role, **data)
             elif path == "/api/tenders/publish":
@@ -719,7 +757,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
-        except DomainError as exc:
+        except (DomainError, QualificationError) as exc:
             self._send(exc.status, {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})

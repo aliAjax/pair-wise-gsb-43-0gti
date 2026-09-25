@@ -23,9 +23,15 @@ class ProcurementFlowTest(unittest.TestCase):
             "proc1", "procurement", "T-001", "数据中心设备", (datetime.now(timezone.utc) + timedelta(seconds=2)).isoformat(), criteria
         )
         self.tender = self.service.publish_tender("proc1", "procurement", self.tender["id"], self.tender["version"])
+        self.qualify(self.vendor1, "vendor1")
+        self.qualify(self.vendor2, "vendor2")
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def qualify(self, vendor, actor):
+        record = self.service.submit_qualification(actor, "vendor", self.tender["id"], vendor["id"], [{"name": "营业执照"}])
+        return self.service.review_qualification("proc1", "procurement", record["id"], "approved", "材料齐全")
 
     def bid(self, vendor, actor, number, price, quality):
         return self.service.submit_bid(actor, "vendor", self.tender["id"], vendor["id"], {"报价": price, "质量": quality}, price)
